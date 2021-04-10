@@ -31,6 +31,8 @@ import android.text.TextUtils;
 import com.android.mms.service.exception.ApnException;
 import com.android.mms.service.exception.MmsHttpException;
 import com.android.mms.service.exception.MmsNetworkException;
+import android.util.Log;
+import com.android.mms.service.PhoneUtils;
 
 /**
  * Base class for MMS requests. This has the common logic of sending/downloading MMS.
@@ -84,6 +86,13 @@ public abstract class MmsRequest {
     // Context used to get TelephonyManager.
     protected Context mContext;
 
+    /* SRPD: Add for Commlog feature @{ */
+    private static final int MMS_EXCEPTION = 1;
+    private static final String ACTION_REPORT_ERRLOG = "com.sprd.intent.action.COMMLOG_REPORTED";
+    private static final String PERMISSION_RECEIVE_ERRLOG = "com.android.permission.RECEIVE_SPRD_COMMLOG";
+    /* @} */
+
+
     public MmsRequest(RequestManager requestManager, int subId, String creator,
             Bundle configOverrides, Context context) {
         mRequestManager = requestManager;
@@ -132,12 +141,17 @@ public abstract class MmsRequest {
      * @param context The context
      * @param networkManager The network manager to use
      */
-    public void execute(Context context, MmsNetworkManager networkManager) {
+    public void execute(Context context, MmsNetworkManager networkManager,boolean isfirstTry) {
         final String requestId = this.toString();
         LogUtil.i(requestId, "Executing...");
         int result = SmsManager.MMS_ERROR_UNSPECIFIED;
         int httpStatusCode = 0;
         byte[] response = null;
+        boolean firstTry=isfirstTry;
+
+        boolean isVowifiConnected=networkManager.isVowifiSmsEnable(mSubId)&&PhoneUtils.isOperatorSupport(context,mSubId);
+         LogUtil.d("MmsRequest execute isVowifiConnected = " + isVowifiConnected);
+
         // TODO: add mms data channel check back to fast fail if no way to send mms,
         // when telephony provides such API.
         if (!ensureMmsConfigLoaded()) { // Check mms config
@@ -151,7 +165,11 @@ public abstract class MmsRequest {
             // Try multiple times of MMS HTTP request, depending on the error.
             for (int i = 0; i < RETRY_TIMES; i++) {
                 try {
-                    networkManager.acquireNetwork(requestId);
+                    if(isVowifiConnected && firstTry){
+                        networkManager.acquireNetworkEx(requestId);
+                    }else{
+                        networkManager.acquireNetwork(requestId);
+                    }
                     final String apnName = networkManager.getApnName();
                     LogUtil.d(requestId, "APN name is " + apnName);
                     try {
@@ -169,12 +187,16 @@ public abstract class MmsRequest {
                             apn = ApnSettings.load(context, null, mSubId, requestId);
                         }
                         LogUtil.i(requestId, "Using " + apn.toString());
-                        response = doHttp(context, networkManager, apn);
+                        response = doHttp(context, networkManager, apn,firstTry,isVowifiConnected);
                         result = Activity.RESULT_OK;
                         // Success
                         break;
                     } finally {
-                        networkManager.releaseNetwork(requestId, this instanceof DownloadRequest);
+                        if(isVowifiConnected){
+                            networkManager.releaseNetworkEx(requestId,this instanceof DownloadRequest);// modify for bug 745864
+                        }else{
+                            networkManager.releaseNetwork(requestId,this instanceof DownloadRequest);// modify for bug 745864
+                        }
                     }
                 } catch (ApnException e) {
                     LogUtil.e(requestId, "APN failure", e);
@@ -201,7 +223,27 @@ public abstract class MmsRequest {
             }
         }
         processResult(context, result, response, httpStatusCode);
+        /* SRPD: Add for Commlog feature @{ */
+        if(result != Activity.RESULT_OK)  {
+            sendErrReport(context, result, httpStatusCode);
+        }
+        /* @} */
     }
+
+    /* SRPD: Add for Commlog feature @{ */
+    private void sendErrReport(Context context, int result, int httpCode) {
+        try {
+            Intent intent = new Intent(ACTION_REPORT_ERRLOG);
+            intent.putExtra("FaultId",MMS_EXCEPTION);
+            intent.putExtra("SubId",mSubId);
+            intent.putExtra("Result",result);
+            intent.putExtra("HttpCode",httpCode);
+            context.sendBroadcast(intent,PERMISSION_RECEIVE_ERRLOG);
+        } catch (Exception e) {
+            LogUtil.e(this.toString(), "sprd commlog mms sendErrReport", e);
+        }
+    }
+    /* @} */
 
     /**
      * Process the result of the completed request, including updating the message status
@@ -292,7 +334,7 @@ public abstract class MmsRequest {
      * @return The HTTP response data
      * @throws MmsHttpException If any network error happens
      */
-    protected abstract byte[] doHttp(Context context, MmsNetworkManager netMgr, ApnSettings apn)
+    protected abstract byte[] doHttp(Context context, MmsNetworkManager netMgr, ApnSettings apn,boolean firstTry,boolean isVowifiConnected)
             throws MmsHttpException;
 
     /**

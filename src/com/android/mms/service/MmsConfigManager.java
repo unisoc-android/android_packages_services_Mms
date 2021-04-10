@@ -30,11 +30,13 @@ import android.telephony.SubscriptionManager;
 import android.telephony.SubscriptionManager.OnSubscriptionsChangedListener;
 import android.util.ArrayMap;
 
-import com.android.internal.telephony.IccCardConstants;
 import com.android.internal.telephony.TelephonyIntents;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 
 /**
  * This class manages cached copies of all the MMS configuration for each subscription ID.
@@ -102,8 +104,11 @@ public class MmsConfigManager {
                 mOnSubscriptionsChangedListener);
     }
 
+    private ExecutorService executorService = Executors.newSingleThreadExecutor();//by bug 1225420
+
     private void loadInBackground() {
         // TODO (ywen) - AsyncTask to avoid creating a new thread?
+        /*
         new Thread() {
             @Override
             public void run() {
@@ -115,6 +120,23 @@ public class MmsConfigManager {
                 load(mContext);
             }
         }.start();
+        */
+        final Runnable runnable = new Runnable() {
+            @Override
+            public void run() {
+                Configuration configuration = mContext.getResources().getConfiguration();
+                // Always put the mnc/mcc in the log so we can tell which mms_config.xml
+                // was loaded.
+                LogUtil.i("MmsConfigManager loads in background mcc/mnc: " +
+                        configuration.mcc + "/" + configuration.mnc);
+                load(mContext);
+            }
+        };
+        try {//by bug 1225420
+            executorService.execute(runnable);
+        } catch (RejectedExecutionException | NullPointerException e) {
+            e.printStackTrace();
+        }
     }
 
     /**

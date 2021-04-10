@@ -22,9 +22,19 @@ import android.util.Log;
 import com.android.i18n.phonenumbers.NumberParseException;
 import com.android.i18n.phonenumbers.PhoneNumberUtil;
 import com.android.i18n.phonenumbers.Phonenumber;
-
+import com.android.mms.service.R;
 import java.util.Locale;
-
+import android.telephony.SubscriptionInfo;
+import android.telephony.SubscriptionManager;
+import android.content.Context;
+import android.content.res.XmlResourceParser;
+import com.android.internal.util.XmlUtils;
+import org.xmlpull.v1.XmlPullParser;
+import org.xmlpull.v1.XmlPullParserException;
+import java.io.IOException;
+import android.database.Cursor;
+import android.net.Uri;
+import android.net.Uri.Builder;
 /**
  * Utility to handle phone numbers.
  */
@@ -39,6 +49,10 @@ public class PhoneUtils {
      * @param phoneText The input phone number text
      * @return The formatted number or the original phone number if failed to parse
      */
+
+    public static int mSubId;
+    public static Context mContext;
+    public static  SubscriptionManager mSubscriptionManager;
     public static String getNationalNumber(TelephonyManager telephonyManager, int subId,
             String phoneText) {
         final String country = getSimOrDefaultLocaleCountry(telephonyManager, subId);
@@ -89,4 +103,39 @@ public class PhoneUtils {
         }
         return country.toUpperCase();
     }
+    public static boolean isOperatorSupport(Context context,int subId){
+        LogUtil.d(" isOperatorSupport");
+        return getSupportMccMncFromVowifiProvider(context,subId);
+    }
+
+
+     public static final String CONTENT_URI = "content://com.spreadtrum.vowifi.accountsettings";
+     public static final String FUN_MESSAGE  = "message";
+     private static final Uri URI_MESSAGE =
+               Uri.parse(CONTENT_URI + "/" + FUN_MESSAGE);
+    private static boolean getSupportMccMncFromVowifiProvider(Context context,int subId) {
+
+        Builder builder = URI_MESSAGE.buildUpon();
+        Uri queryUri = builder.appendQueryParameter("subId", String.valueOf(subId)).build();
+
+        Cursor cursor = context.getContentResolver().query(queryUri, null, null, null, null);
+        try {
+            if (cursor != null && cursor.moveToFirst()) {
+                int index = cursor.getColumnIndexOrThrow("mmsSupport");
+                LogUtil.d(" getSupportMccMncFromVowifiProvider"+index);
+                if (index > -1) {
+
+                    return cursor.getInt(index) == 1 ? true : false;
+                }
+            }
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+
+        return false;
+    }
+
+  
 }

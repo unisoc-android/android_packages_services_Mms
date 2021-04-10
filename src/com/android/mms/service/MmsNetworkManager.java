@@ -24,7 +24,15 @@ import android.net.NetworkInfo;
 import android.net.NetworkRequest;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
+import android.util.Log;
+import android.telephony.SubscriptionManager;
 
+import com.android.ims.ImsConfig;
+import com.android.ims.internal.ImsManagerEx;
+import com.android.ims.internal.IImsServiceEx;
+import com.android.mms.service.vowifi.ConnectivityManagerEx;
+import com.android.mms.service.vowifi.VowifiNetwork;
 import com.android.mms.service.exception.MmsNetworkException;
 
 /**
@@ -33,7 +41,7 @@ import com.android.mms.service.exception.MmsNetworkException;
 public class MmsNetworkManager {
     // Timeout used to call ConnectivityManager.requestNetwork
     // Given that the telephony layer will retry on failures, this timeout should be high enough.
-    private static final int NETWORK_REQUEST_TIMEOUT_MILLIS = 30 * 60 * 1000;
+    private static final int NETWORK_REQUEST_TIMEOUT_MILLIS = 60 * 1000;//30 * 60 * 1000;
     // Wait timeout for this class, a little bit longer than the above timeout
     // to make sure we don't bail prematurely
     private static final int NETWORK_ACQUIRE_TIMEOUT_MILLIS =
@@ -43,7 +51,15 @@ public class MmsNetworkManager {
     private static final int NETWORK_RELEASE_TIMEOUT_MILLIS = 5 * 1000;
 
     private final Context mContext;
-
+    // add for Mms over wifi Begin
+    private volatile ConnectivityManagerEx mConnectivityManagerEx;
+    private VowifiNetwork mVowifiNetwork;
+    private MmsHttpClient mMmsHttpClientEx;
+    private final NetworkRequest mNetworkRequestEx; 
+    private int mMmsRequestCountEx;
+    private final Runnable mNetworkReleaseTask;
+    private ConnectivityManagerEx.VowifiNetworkCallback mwifiNetworkCallback;
+    // add for Mms over wifi End
     // The requested MMS {@link android.net.Network} we are holding
     // We need this when we unbind from it. This is also used to indicate if the
     // MMS network is available.
@@ -65,10 +81,49 @@ public class MmsNetworkManager {
     private final Handler mReleaseHandler;
 
     // The task that does the delayed releasing of the network.
-    private final Runnable mNetworkReleaseTask;
+    private final Runnable mWifiNetworkReleaseTask;
 
     // The SIM ID which we use to connect
     private final int mSubId;
+
+    /**
+     * Network callback for our wifi network request
+     */
+    private class VowifiNetworkRequestCallback extends ConnectivityManagerEx.VowifiNetworkCallback {
+        @Override
+        public void onAvailable(VowifiNetwork network) {
+            super.onAvailable(network);
+            LogUtil.d("VowifiNetworkCallbackListener.onAvailable: network=" + network +
+                                  ", mSubId=" + mSubId);
+            synchronized (MmsNetworkManager.this) {
+                if (mwifiNetworkCallback !=null) {
+                    mVowifiNetwork = network;
+                }
+                MmsNetworkManager.this.notifyAll();
+            }
+        }
+
+        @Override
+        public void onLost(VowifiNetwork network) {
+            super.onLost(network);
+            LogUtil.d("VowifiNetworkCallbackListener.onLost: network=" + network +
+                                  ", mSubId=" + mSubId);
+            synchronized (MmsNetworkManager.this) {
+                MmsNetworkManager.this.notifyAll();
+                releaseRequestLockedEx(this);
+            }
+        }
+
+        @Override
+        public void onUnavailable() {
+            super.onUnavailable();
+            LogUtil.d("VowifiNetworkCallbackListener.onUnavailable" + ", mSubId=" + mSubId);
+            synchronized (MmsNetworkManager.this) {
+                MmsNetworkManager.this.notifyAll();
+                releaseRequestLockedEx(this);
+                }
+            }
+        }
 
     /**
      * Network callback for our network request
@@ -112,13 +167,23 @@ public class MmsNetworkManager {
         mMmsRequestCount = 0;
         mConnectivityManager = null;
         mMmsHttpClient = null;
-        mSubId = subId;
+        mVowifiNetwork=null;
+        mConnectivityManagerEx=ConnectivityManagerEx.from(context);// add for Mms over wifi
+        mMmsHttpClientEx=null;
+        mMmsRequestCountEx = 0;
         mReleaseHandler = new Handler(Looper.getMainLooper());
+        mSubId = subId;
         mNetworkRequest = new NetworkRequest.Builder()
                 .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
                 .addCapability(NetworkCapabilities.NET_CAPABILITY_MMS)
                 .setNetworkSpecifier(Integer.toString(mSubId))
                 .build();
+        // for MMS over ePDG demo: use internet over wifi
+         mNetworkRequestEx = new NetworkRequest.Builder()
+                  .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                  .addCapability(NetworkCapabilities.NET_CAPABILITY_MMS)
+                  .setNetworkSpecifier(Integer.toString(mSubId))
+                  .build();
 
         mNetworkReleaseTask = new Runnable() {
             @Override
@@ -126,12 +191,64 @@ public class MmsNetworkManager {
                 synchronized (this) {
                     if (mMmsRequestCount < 1) {
                         releaseRequestLocked(mNetworkCallback);
-                    }
                 }
             }
-        };
+        }
+    };
+        mWifiNetworkReleaseTask = new Runnable() {
+            @Override
+            public void run() {
+                synchronized (this) {
+                    if (mMmsRequestCountEx < 1) {
+                        releaseRequestLockedEx(mwifiNetworkCallback);
+                }
+            }
+        }
+    };
     }
 
+    /**
+     * Acquire the MMS network of vowifi
+     *
+     * @param requestId request ID for logging
+     * @throws com.android.mms.service.exception.MmsNetworkException if we fail to acquire it
+     */
+    public void acquireNetworkEx(final String requestId) throws MmsNetworkException {
+        synchronized (this) {
+            // Since we are acquiring the network, remove the network release task if exists.
+            mReleaseHandler.removeCallbacks(mWifiNetworkReleaseTask);
+            mMmsRequestCountEx += 1;
+            if (mVowifiNetwork != null) {
+                // Already available
+                LogUtil.d(requestId, "MmsNetworkManager:  WifiNetwork already available");
+                return;
+            }
+            // Not available, so start a new request if not done yet
+            if (mwifiNetworkCallback== null) {
+                LogUtil.d(requestId, "MmsNetworkManager: start new WifiNetwork request");
+                startNewNetworkRequestLockedEx();
+            }
+            final long shouldEnd = SystemClock.elapsedRealtime() + NETWORK_ACQUIRE_TIMEOUT_MILLIS;
+            long waitTime = NETWORK_ACQUIRE_TIMEOUT_MILLIS;
+            while (waitTime > 0) {
+                try {
+                    this.wait(waitTime);
+                } catch (InterruptedException e) {
+                    LogUtil.w(requestId, "MmsNetworkManager: acquire WifiNetwork wait interrupted");
+                }
+                if (mVowifiNetwork != null) {
+                    // Success
+                    return;
+                }
+                // Calculate remaining waiting time to make sure we wait the full timeout period
+                waitTime = shouldEnd - SystemClock.elapsedRealtime();
+            }
+            // Timed out, so release the request and fail
+            LogUtil.e(requestId, "MmsNetworkManager: wifi timed out");
+            releaseRequestLockedEx(mwifiNetworkCallback);
+            throw new MmsNetworkException("Acquiring WifiNetwork timed out");
+            }
+        } 
     /**
      * Acquire the MMS network
      *
@@ -143,6 +260,7 @@ public class MmsNetworkManager {
             // Since we are acquiring the network, remove the network release task if exists.
             mReleaseHandler.removeCallbacks(mNetworkReleaseTask);
             mMmsRequestCount += 1;
+            LogUtil.d(requestId, "MmsNetworkManager: acquireNetwork"+mMmsRequestCount);
             if (mNetwork != null) {
                 // Already available
                 LogUtil.d(requestId, "MmsNetworkManager: already available");
@@ -204,6 +322,33 @@ public class MmsNetworkManager {
             }
         }
     }
+    /**
+     * Release the MMS network over wifi when nobody is holding on to it.
+     *
+     * @param requestId request ID for logging
+     * @param shouldDelayRelease whether the release should be delayed for 5 seconds, the regular
+     *                           use case is to delay this for DownloadRequests to use the network
+     *                           for sending an acknowledgement on the same network
+     */
+    public void releaseNetworkEx(final String requestId, final boolean shouldDelayRelease) {
+        synchronized (this) {
+            if (mMmsRequestCountEx > 0) {
+                mMmsRequestCountEx -= 1;
+                LogUtil.d(requestId, "MmsNetworkManager:  wifiNetwork release, count=" + mMmsRequestCountEx);
+                if (mMmsRequestCountEx < 1) {
+                    if (shouldDelayRelease) {
+                        // remove previously posted task and post a delayed task on the release
+                        // handler to release the network
+                        mReleaseHandler.removeCallbacks(mWifiNetworkReleaseTask);
+                        mReleaseHandler.postDelayed(mWifiNetworkReleaseTask,
+                                NETWORK_RELEASE_TIMEOUT_MILLIS);
+                    } else {
+                        releaseRequestLockedEx(mwifiNetworkCallback);
+                    }
+                }
+            }
+        }
+    }
 
     /**
      * Start a new {@link android.net.NetworkRequest} for MMS
@@ -213,6 +358,17 @@ public class MmsNetworkManager {
         mNetworkCallback = new NetworkRequestCallback();
         connectivityManager.requestNetwork(
                 mNetworkRequest, mNetworkCallback, NETWORK_REQUEST_TIMEOUT_MILLIS);
+    }
+    /* Modify by SPRD for bug 542996 End */
+    /**
+     * Start a new {@link android.net.NetworkRequest} for MMS over wifi
+     */
+    private void startNewNetworkRequestLockedEx() {
+        final ConnectivityManagerEx connectivityManagerEx = getConnectivityManagerEx();
+        mwifiNetworkCallback = new VowifiNetworkRequestCallback();
+        LogUtil.d("connectivityManagerEx.requestwifiNetwork");
+        connectivityManagerEx.requestImsNetwork(
+                mNetworkRequestEx, mwifiNetworkCallback, mSubId);
     }
 
     /**
@@ -238,7 +394,29 @@ public class MmsNetworkManager {
         }
         resetLocked();
     }
-
+    /**
+     * Release the current {@link android.net.NetworkRequest} for MMS over wifi
+     *
+     * @param callback the {@link android.net.ConnectivityManager.NetworkCallback} to unregister
+     */
+    private void releaseRequestLockedEx(ConnectivityManagerEx.VowifiNetworkCallback callback) {
+        if (callback != null) {
+            final ConnectivityManagerEx connectivityManagerEx = getConnectivityManagerEx();
+            try {
+                connectivityManagerEx.unregisterImsNetworkCallback(callback,mSubId);
+            } catch (IllegalArgumentException e) {
+                // It is possible ConnectivityManager.requestNetwork may fail silently due
+                // to RemoteException. When that happens, we may get an invalid
+                // NetworkCallback, which causes an IllegalArgumentexception when we try to
+                // unregisterNetworkCallback. This exception in turn causes
+                // MmsNetworkManager to skip resetLocked() in the below. Thus MMS service
+                // would get stuck in the bad state until the device restarts. This fix
+                // catches the exception so that state clean up can be executed.
+                LogUtil.w("Unregister network callback exception", e);
+            }
+        }
+        resetLockedEx();
+    }
     /**
      * Reset the state
      */
@@ -248,6 +426,15 @@ public class MmsNetworkManager {
         mMmsRequestCount = 0;
         mMmsHttpClient = null;
     }
+    /**
+     * Reset the state
+     */
+    private void resetLockedEx() {
+        mwifiNetworkCallback= null;
+        mVowifiNetwork= null;
+        mMmsRequestCountEx = 0;
+        mMmsHttpClientEx = null;
+    }
 
     private ConnectivityManager getConnectivityManager() {
         if (mConnectivityManager == null) {
@@ -256,7 +443,29 @@ public class MmsNetworkManager {
         }
         return mConnectivityManager;
     }
+    private ConnectivityManagerEx getConnectivityManagerEx() {
+        if (mConnectivityManagerEx == null) {
+            mConnectivityManagerEx=ConnectivityManagerEx.from(mContext);
+        }
+        return mConnectivityManagerEx;
+    }
 
+        /**
+     * Get an MmsHttpClient for the current wifi network
+     *
+     * @return The MmsHttpClient instance
+     */
+    public MmsHttpClient getOrCreateHttpClientEx() {
+        synchronized (this) {
+            if (mMmsHttpClientEx == null) {
+                if (mVowifiNetwork != null) {
+                    // Create new MmsHttpClient for the current Network
+                    mMmsHttpClientEx = new MmsHttpClient(mContext, mVowifiNetwork, mConnectivityManagerEx);
+                }
+            }
+            return mMmsHttpClientEx;
+        }
+    }
     /**
      * Get an MmsHttpClient for the current network
      *
@@ -294,5 +503,29 @@ public class MmsNetworkManager {
             apnName = mmsNetworkInfo.getExtraInfo();
         }
         return apnName;
+    }
+
+    private boolean isVowifiConnected() {
+        boolean isVowifiConnected = false;
+        try {
+            IImsServiceEx imsServiceEx = ImsManagerEx.getIImsServiceEx();
+            if (imsServiceEx != null
+                    && ImsConfig.FeatureConstants.FEATURE_TYPE_VOICE_OVER_WIFI == imsServiceEx.getCurrentImsFeature()) {
+                isVowifiConnected = true;
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return isVowifiConnected;
+    }
+
+    public  boolean isVowifiSmsEnable(int subId) {
+        boolean isVowifiConnected = isVowifiConnected();
+        int primaryPhoneId= SubscriptionManager.from(mContext).getDefaultDataPhoneId();
+        int phoneId = SubscriptionManager.getPhoneId(subId);
+        Log.d("MmsNetworkManager", "isVowifiSmsEnable subId = " + subId + ", phoneId = " + phoneId
+                + ", primaryPhoneId =" + primaryPhoneId + ", isVowifiConnected = "
+                + isVowifiConnected);
+        return ((phoneId == primaryPhoneId) && isVowifiConnected);
     }
 }

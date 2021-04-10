@@ -49,6 +49,7 @@ import com.google.android.mms.pdu.PduPersister;
 import com.google.android.mms.pdu.SendConf;
 import com.google.android.mms.pdu.SendReq;
 import com.google.android.mms.util.SqliteWrapper;
+import com.android.mms.service.PhoneUtils;
 
 /**
  * Request to send an MMS
@@ -69,10 +70,16 @@ public class SendRequest extends MmsRequest {
     }
 
     @Override
-    protected byte[] doHttp(Context context, MmsNetworkManager netMgr, ApnSettings apn)
+    protected byte[] doHttp(Context context, MmsNetworkManager netMgr, ApnSettings apn,boolean firstTry,boolean isVowifiConnected)
             throws MmsHttpException {
         final String requestId = getRequestId();
-        final MmsHttpClient mmsHttpClient = netMgr.getOrCreateHttpClient();
+        final MmsHttpClient mmsHttpClient ;
+
+        if(isVowifiConnected && firstTry){
+            mmsHttpClient = netMgr.getOrCreateHttpClientEx();
+        }else{
+            mmsHttpClient = netMgr.getOrCreateHttpClient();
+        }
         if (mmsHttpClient == null) {
             LogUtil.e(requestId, "MMS network is not ready!");
             throw new MmsHttpException(0/*statusCode*/, "MMS network is not ready");
@@ -89,7 +96,9 @@ public class SendRequest extends MmsRequest {
                 apn.getProxyPort(),
                 mMmsConfig,
                 mSubId,
-                requestId);
+                requestId,
+                isVowifiConnected,
+                firstTry);
     }
 
     private GenericPdu parsePdu() {

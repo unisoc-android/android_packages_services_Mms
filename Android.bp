@@ -19,7 +19,13 @@ android_app {
     name: "MmsService",
     platform_apis: true,
     privileged: true,
-    libs: ["telephony-common"],
+    libs: [
+        "telephony-common",
+        "unisoc_ims_common"
+    ],
+    static_libs: [
+        "services.net"
+    ],
     srcs: ["src/**/*.java"],
     resource_dirs: ["res"],
     aaptflags: ["--auto-add-overlay"],

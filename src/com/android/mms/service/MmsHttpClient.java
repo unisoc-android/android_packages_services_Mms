@@ -51,7 +51,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-
+import com.android.mms.service.vowifi.ConnectivityManagerEx;
+import com.android.mms.service.vowifi.VowifiNetwork;
 /**
  * MMS HTTP client for sending and downloading MMS messages
  */
@@ -84,6 +85,8 @@ public class MmsHttpClient {
     private final Context mContext;
     private final Network mNetwork;
     private final ConnectivityManager mConnectivityManager;
+    private final VowifiNetwork mNetworkVowifi;
+    private final ConnectivityManagerEx mConnectivityManagerEx;
 
     /**
      * Constructor
@@ -97,7 +100,23 @@ public class MmsHttpClient {
         // Mms server is on a carrier private network so it may not be resolvable using 3rd party
         // private dns
         mNetwork = network.getPrivateDnsBypassingCopy();
+		mNetworkVowifi = null;
+        mConnectivityManagerEx = null;
         mConnectivityManager = connectivityManager;
+    }
+    /**
+     * Constructor
+     *  @param context The Context object
+     * @param network The Network for creating an OKHttp client
+     * @param connectivityManager
+     */
+    public MmsHttpClient(Context context,
+        VowifiNetwork vowifiNetwork,ConnectivityManagerEx connectivityManagerEx) {
+        mContext = context;
+        mNetworkVowifi = vowifiNetwork;
+        mConnectivityManagerEx = connectivityManagerEx;
+        mNetwork = null;
+        mConnectivityManager = null;
     }
 
     /**
@@ -117,7 +136,7 @@ public class MmsHttpClient {
      * @throws MmsHttpException For any failures
      */
     public byte[] execute(String urlString, byte[] pdu, String method, boolean isProxySet,
-            String proxyHost, int proxyPort, Bundle mmsConfig, int subId, String requestId)
+            String proxyHost, int proxyPort, Bundle mmsConfig, int subId, String requestId,boolean isVowifiConnected,boolean firstTry)
             throws MmsHttpException {
         LogUtil.d(requestId, "HTTP: " + method + " " + redactUrlForNonVerbose(urlString)
                 + (isProxySet ? (", proxy=" + proxyHost + ":" + proxyPort) : "")
@@ -127,13 +146,24 @@ public class MmsHttpClient {
         try {
             Proxy proxy = Proxy.NO_PROXY;
             if (isProxySet) {
+                if(isVowifiConnected && firstTry){
+                proxy = new Proxy(Proxy.Type.HTTP,
+                        new InetSocketAddress(mNetworkVowifi.getByName(proxyHost), proxyPort));
+                }else{
                 proxy = new Proxy(Proxy.Type.HTTP,
                         new InetSocketAddress(mNetwork.getByName(proxyHost), proxyPort));
+                }
             }
             final URL url = new URL(urlString);
-            maybeWaitForIpv4(requestId, url);
+            if(!(isVowifiConnected && firstTry)){
+                maybeWaitForIpv4(requestId, url);
+            }
             // Now get the connection
-            connection = (HttpURLConnection) mNetwork.openConnection(url, proxy);
+            if(isVowifiConnected && firstTry){
+            	connection = (HttpURLConnection) mNetworkVowifi.openConnection(url, proxy);
+            }else{
+            	connection = (HttpURLConnection) mNetwork.openConnection(url, proxy);
+            }
             connection.setDoInput(true);
             connection.setConnectTimeout(
                     mmsConfig.getInt(SmsManager.MMS_CONFIG_HTTP_SOCKET_TIMEOUT));
